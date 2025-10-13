@@ -1,0 +1,201 @@
+<?php
+/**
+ * Plugin Name: ChatKit Embed (Single File)
+ * Description: Adds a [chatkit] shortcode and a secure token endpoint for ChatKit.
+ * Version: 1.0.8
+ */
+
+if ( ! defined('ABSPATH') ) { exit; }
+
+/**
+ * REST route to mint a short-lived client secret (or token).
+ * Test: https://YOURDOMAIN/?rest_route=/chatkit/v1/token
+ * Put your OpenAI key in wp-config.php:
+ *   define('OPENAI_API_KEY','sk-xxxxx');
+ */
+add_action('rest_api_init', function () {
+    register_rest_route('chatkit/v1','/token', array(
+        'methods'  => array('GET','POST'),
+        'callback' => function ( WP_REST_Request $req ) {
+            $api_key = defined('OPENAI_API_KEY') ? OPENAI_API_KEY : getenv('OPENAI_API_KEY');
+            if (!$api_key) {
+                return new WP_REST_Response(array('ok'=>false,'error'=>'OPENAI_API_KEY not set'), 500);
+            }
+            $params = $req->get_json_params(); if (!is_array($params)) { $params = array(); }
+            $workflow_id = isset($params['workflow_id']) ? sanitize_text_field($params['workflow_id']) : null;
+
+            $body = array(); if ($workflow_id) { $body['workflow_id'] = $workflow_id; }
+            $args = array(
+                'method'  => 'POST',
+                'headers' => array('Authorization'=>'Bearer '.$api_key,'Content-Type'=>'application/json'),
+                'body'    => wp_json_encode($body),
+                'timeout' => 25,
+            );
+
+            $eps = array(
+                'https://api.openai.com/v1/chatkit/sessions',
+                'https://api.openai.com/v1/realtime/sessions',
+            );
+            $data = null; $last_err = null; $last_raw = null; $last_code = null;
+            foreach ($eps as $ep) {
+                $r = wp_remote_post($ep, $args);
+                if (is_wp_error($r)) { $last_err = $r->get_error_message(); continue; }
+                $code = wp_remote_retrieve_response_code($r);
+                $raw  = wp_remote_retrieve_body($r);
+                if ($code >= 200 && $code < 300) { $data = json_decode($raw, true); break; }
+                $last_code = $code; $last_raw = $raw;
+            }
+            if (!$data) {
+                return new WP_REST_Response(array('ok'=>false,'error'=>'OpenAI session create failed','detail'=>$last_err ? $last_err : $last_raw,'status'=>$last_code), 500);
+            }
+
+            // Normalize to clientSecret (ek_...)
+            $secret = null;
+            if (isset($data['client_secret']['value'])) { $secret = $data['client_secret']['value']; }
+            elseif (isset($data['client_token']))       { $secret = $data['client_token']; }
+            elseif (isset($data['token']))              { $secret = $data['token']; }
+
+            if (!$secret) {
+                return new WP_REST_Response(array('ok'=>false,'error'=>'No client_secret in response','detail'=>$data), 500);
+            }
+            return new WP_REST_Response(array('ok'=>true,'clientSecret'=>$secret), 200);
+        },
+        'permission_callback' => '__return_true',
+    ));
+});
+
+/**
+ * Shortcode:
+ *   [chatkit script="https://cdn.platform.openai.com/deployments/chatkit/chatkit.js" scheme="light" domain_key="domain_pk_..."]
+ *
+ * Note: add both tamror.com and www.tamror.com to your allowlist if needed.
+ */
+add_shortcode('chatkit', function($atts){
+    // If rendering in admin/editor, avoid running the widget inside the iframe
+    if ( is_admin() ) {
+        return '<div style="padding:12px;border:1px dashed #ccc;border-radius:8px;">ChatKit will render on the front-end. Use "View Page" to see it live.</div>';
+    }
+
+    $atts = shortcode_atts(array(
+        'script'      => 'https://cdn.platform.openai.com/deployments/chatkit/chatkit.js',
+        'scheme'      => 'light',          // light or dark
+        'domain_key'  => '',               // domain_pk_...
+        'workflow_id' => '',
+        'height'      => '600px',
+        'width'       => '100%',
+    ), $atts, 'chatkit');
+
+    $token_url   = esc_url_raw( home_url('/?rest_route=/chatkit/v1/token') );
+    $script_js   = esc_js($atts['script']);
+    $scheme_js   = esc_js($atts['scheme']);
+    $domain_js   = esc_js($atts['domain_key']);
+    $workflow_js = esc_js($atts['workflow_id']);
+    $height_css  = esc_attr($atts['height']);
+    $width_css   = esc_attr($atts['width']);
+
+    ob_start(); ?>
+    <div class="chatkit-embed-wrap" style="max-width:920px;margin:24px auto;padding:12px;">
+      <?php if (!empty($domain_js)) : ?>
+        <meta name="openai-domain-public-key" content="<?php echo esc_attr($domain_js); ?>">
+      <?php endif; ?>
+      <div id="chatkit-mount">
+        <div id="chatkit-fallback" style="padding:12px;border:1px dashed #ccc;border-radius:8px;display:none;"></div>
+      </div>
+    </div>
+
+    <script type="module">
+    (function(){
+      try {
+        var scriptUrl = "<?php echo $script_js; ?>";
+        function loadModule(u){
+          return new Promise(function(res,rej){
+            var s = document.createElement("script");
+            s.type = "module";
+            s.src = u;
+            s.onload = res;
+            s.onerror = rej;
+            document.head.appendChild(s);
+          });
+        }
+        function showFallback(msg, detail){
+          var fb = document.getElementById("chatkit-fallback");
+          if(!fb) return;
+          fb.style.display = "block";
+          var html = "<strong>ChatKit did not load.</strong><br/>" + (msg ? msg : "");
+          if (detail) {
+            html += '<pre style="white-space:pre-wrap;background:#f7f7f7;padding:8px;border-radius:6px;overflow:auto;">' + String(detail).replace(/</g,"&lt;") + "</pre>";
+          }
+          html += '<br/><em>Tips:</em><ul style="margin:8px 0 0 18px;"><li>Script must return JS: <code>' + scriptUrl + '</code></li><li>Your domain must be allow-listed and the domain public key must match.</li></ul>';
+          fb.innerHTML = html;
+        }
+
+        loadModule(scriptUrl).then(function(){
+          if (!customElements.get("openai-chatkit")) {
+            if (window.customElements && customElements.whenDefined) {
+              return customElements.whenDefined("openai-chatkit");
+            }
+          }
+        }).then(function(){
+          if (!customElements.get("openai-chatkit")) {
+            showFallback("The <openai-chatkit> web component is not registered (script missing or blocked).");
+            return;
+          }
+
+          var mount = document.getElementById("chatkit-mount");
+          var el = document.createElement("openai-chatkit");
+          el.style.display = "block";
+          el.style.height  = "<?php echo $height_css; ?>";
+          el.style.width   = "<?php echo $width_css; ?>";
+          el.style.borderRadius = "10px";
+          el.style.overflow = "hidden";
+
+          function getClientSecret(){
+            return fetch("<?php echo esc_js($token_url); ?>", {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({ workflow_id: "<?php echo $workflow_js; ?>" })
+            }).then(function(r){ return r.json(); }).then(function(data){
+              if (!data || !data.clientSecret) { throw new Error("Token route failed: " + JSON.stringify(data)); }
+              return data.clientSecret; // ek_...
+            });
+          }
+
+          // Try variants: with publicKey, with domainPublicKey, and no key
+          var cfgs = [
+            { api: { getClientSecret: getClientSecret }, theme: "<?php echo $scheme_js; ?>", publicKey: "<?php echo $domain_js; ?>" },
+            { api: { getClientSecret: getClientSecret }, theme: "<?php echo $scheme_js; ?>", domainPublicKey: "<?php echo $domain_js; ?>" },
+            { api: { getClientSecret: getClientSecret }, theme: "<?php echo $scheme_js; ?>" }
+          ];
+
+          var applied = false, lastErr = null;
+          for (var i=0;i<cfgs.length;i++){
+            try { el.setOptions(cfgs[i]); applied = true; break; }
+            catch(e){ lastErr = e; }
+          }
+          if (!applied) { showFallback("Could not configure ChatKit (setOptions). Check console.", lastErr); return; }
+
+          mount.innerHTML = "";
+          mount.appendChild(el);
+
+          setTimeout(function(){
+            try {
+              var ok = !!(el.shadowRoot && el.shadowRoot.children && el.shadowRoot.children.length);
+              if (!ok) {
+                showFallback("Component rendered then disappeared. Domain verification may have failed (401). Ensure the domain public key is correct and matches the allow-listed domain.");
+              }
+            } catch(e){}
+          }, 1600);
+        }).catch(function(e){
+          console.error("ChatKit bootstrap error:", e);
+          showFallback("Bootstrap error.", e && (e.message || e.toString()));
+        });
+      } catch(err) {
+        console.error("ChatKit fatal error:", err);
+        var fb2 = document.getElementById("chatkit-fallback");
+        if (fb2) { fb2.style.display="block"; fb2.textContent = "ChatKit failed: " + (err && err.message ? err.message : String(err)); }
+      }
+    })();
+    </script>
+    <?php
+    return ob_get_clean();
+});
