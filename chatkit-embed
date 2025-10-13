@@ -2,14 +2,14 @@
 /**
  * Plugin Name: ChatKit Embed (Single File)
  * Description: Adds a [chatkit] shortcode and a secure token endpoint for ChatKit.
- * Version: 1.0.8
+ * Version: 1.0.9
  */
 
 if ( ! defined('ABSPATH') ) { exit; }
 
 /**
  * REST route to mint a short-lived client secret (or token).
- * Test: https://YOURDOMAIN/?rest_route=/chatkit/v1/token
+ * Test in browser: https://YOURDOMAIN/?rest_route=/chatkit/v1/token
  * Put your OpenAI key in wp-config.php:
  *   define('OPENAI_API_KEY','sk-xxxxx');
  */
@@ -32,6 +32,7 @@ add_action('rest_api_init', function () {
                 'timeout' => 25,
             );
 
+            // Try ChatKit sessions first, then Realtime sessions as fallback
             $eps = array(
                 'https://api.openai.com/v1/chatkit/sessions',
                 'https://api.openai.com/v1/realtime/sessions',
@@ -68,10 +69,13 @@ add_action('rest_api_init', function () {
  * Shortcode:
  *   [chatkit script="https://cdn.platform.openai.com/deployments/chatkit/chatkit.js" scheme="light" domain_key="domain_pk_..."]
  *
- * Note: add both tamror.com and www.tamror.com to your allowlist if needed.
+ * Notes:
+ *   - We insert the domain public key into <head> as a <meta> tag.
+ *   - We DO NOT pass publicKey/domainPublicKey to setOptions (some builds reject it).
+ *   - Uses query-style REST URL so it works even if permalinks are odd.
+ *   - Skips running inside WP admin/editor to avoid iframe preview issues.
  */
 add_shortcode('chatkit', function($atts){
-    // If rendering in admin/editor, avoid running the widget inside the iframe
     if ( is_admin() ) {
         return '<div style="padding:12px;border:1px dashed #ccc;border-radius:8px;">ChatKit will render on the front-end. Use "View Page" to see it live.</div>';
     }
@@ -95,9 +99,6 @@ add_shortcode('chatkit', function($atts){
 
     ob_start(); ?>
     <div class="chatkit-embed-wrap" style="max-width:920px;margin:24px auto;padding:12px;">
-      <?php if (!empty($domain_js)) : ?>
-        <meta name="openai-domain-public-key" content="<?php echo esc_attr($domain_js); ?>">
-      <?php endif; ?>
       <div id="chatkit-mount">
         <div id="chatkit-fallback" style="padding:12px;border:1px dashed #ccc;border-radius:8px;display:none;"></div>
       </div>
@@ -107,6 +108,20 @@ add_shortcode('chatkit', function($atts){
     (function(){
       try {
         var scriptUrl = "<?php echo $script_js; ?>";
+        var domainKey = "<?php echo $domain_js; ?>";
+
+        // Ensure domain public key meta is present in <head> for hosted verification
+        (function ensureDomainMeta(){
+          if (!domainKey) return;
+          var existing = document.querySelector('meta[name="openai-domain-public-key"]');
+          if (!existing) {
+            var m = document.createElement("meta");
+            m.setAttribute("name", "openai-domain-public-key");
+            m.setAttribute("content", domainKey);
+            document.head.appendChild(m);
+          }
+        })();
+
         function loadModule(u){
           return new Promise(function(res,rej){
             var s = document.createElement("script");
@@ -117,6 +132,7 @@ add_shortcode('chatkit', function($atts){
             document.head.appendChild(s);
           });
         }
+
         function showFallback(msg, detail){
           var fb = document.getElementById("chatkit-fallback");
           if(!fb) return;
@@ -160,19 +176,11 @@ add_shortcode('chatkit', function($atts){
             });
           }
 
-          // Try variants: with publicKey, with domainPublicKey, and no key
-          var cfgs = [
-            { api: { getClientSecret: getClientSecret }, theme: "<?php echo $scheme_js; ?>", publicKey: "<?php echo $domain_js; ?>" },
-            { api: { getClientSecret: getClientSecret }, theme: "<?php echo $scheme_js; ?>", domainPublicKey: "<?php echo $domain_js; ?>" },
-            { api: { getClientSecret: getClientSecret }, theme: "<?php echo $scheme_js; ?>" }
-          ];
+          // Use simple options; domain key is provided via <meta> in <head>
+          var cfg = { api: { getClientSecret: getClientSecret }, theme: "<?php echo $scheme_js; ?>" };
 
-          var applied = false, lastErr = null;
-          for (var i=0;i<cfgs.length;i++){
-            try { el.setOptions(cfgs[i]); applied = true; break; }
-            catch(e){ lastErr = e; }
-          }
-          if (!applied) { showFallback("Could not configure ChatKit (setOptions). Check console.", lastErr); return; }
+          try { el.setOptions(cfg); }
+          catch(e){ showFallback("Could not configure ChatKit (setOptions). Check console.", e && (e.message || e.toString())); return; }
 
           mount.innerHTML = "";
           mount.appendChild(el);
@@ -181,7 +189,7 @@ add_shortcode('chatkit', function($atts){
             try {
               var ok = !!(el.shadowRoot && el.shadowRoot.children && el.shadowRoot.children.length);
               if (!ok) {
-                showFallback("Component rendered then disappeared. Domain verification may have failed (401). Ensure the domain public key is correct and matches the allow-listed domain.");
+                showFallback("Component rendered then disappeared. Domain verification may have failed (401). Ensure the domain public key meta matches the allow-listed domain.");
               }
             } catch(e){}
           }, 1600);
