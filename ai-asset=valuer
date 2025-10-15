@@ -1,0 +1,538 @@
+<?php
+/**
+ * Plugin Name: AI Asset Valuer
+ * Description: Image valuation (OpenAI), Assets CPT, save endpoint, and assets table shortcode (language filter/UI + dates localized to the shortcode language).
+ * Version:     1.2.4
+ * Author:      Your Team
+ * License:     GPLv2 or later
+ */
+
+namespace AIAAS\Valuer;
+
+if (!defined('ABSPATH')) exit;
+
+/* =========================================================
+ * 1) Register "Assets" CPT
+ * =======================================================*/
+function register_cpt() {
+  register_post_type('aiaas_asset', [
+    'label' => 'Assets',
+    'labels' => [
+      'name'          => 'Assets',
+      'singular_name' => 'Asset',
+      'add_new_item'  => 'Add New Asset',
+      'edit_item'     => 'Edit Asset',
+      'view_item'     => 'View Asset',
+      'search_items'  => 'Search Assets',
+    ],
+    'public'        => true,
+    'show_in_menu'  => true,
+    'menu_position' => 21,
+    'menu_icon'     => 'dashicons-archive',
+    'supports'      => ['title', 'thumbnail', 'custom-fields'],
+    'has_archive'   => true,
+    'show_in_rest'  => true,
+  ]);
+}
+add_action('init', __NAMESPACE__ . '\\register_cpt');
+
+register_activation_hook(__FILE__, function () { register_cpt(); flush_rewrite_rules(); });
+register_deactivation_hook(__FILE__, function () { flush_rewrite_rules(); });
+
+/* =========================================================
+ * 2) Save base64 image to Media Library
+ * =======================================================*/
+function save_base64_image( $dataUrl, $post_id = 0 ) {
+  if (!$dataUrl || strpos($dataUrl, 'data:image/') !== 0) return 0;
+  if (!preg_match('/^data:image\/(\w+);base64,/', $dataUrl, $m)) return 0;
+
+  $ext  = strtolower($m[1]);
+  $data = base64_decode(substr($dataUrl, strpos($dataUrl, ',') + 1));
+  if ($data === false) return 0;
+
+  $upload   = wp_upload_dir();
+  $filename = 'asset-' . time() . '-' . wp_generate_uuid4() . '.' . $ext;
+  $filepath = trailingslashit($upload['path']) . $filename;
+
+  if (!file_put_contents($filepath, $data)) return 0;
+
+  $filetype = wp_check_filetype($filename, null);
+  $attachment_id = wp_insert_attachment([
+    'post_mime_type' => $filetype['type'],
+    'post_title'     => sanitize_file_name($filename),
+    'post_content'   => '',
+    'post_status'    => 'inherit',
+  ], $filepath, $post_id);
+
+  if (is_wp_error($attachment_id)) return 0;
+
+  require_once ABSPATH . 'wp-admin/includes/image.php';
+  $attach_data = wp_generate_attachment_metadata($attachment_id, $filepath);
+  wp_update_attachment_metadata($attachment_id, $attach_data);
+
+  if ($post_id) set_post_thumbnail($post_id, $attachment_id);
+
+  return $attachment_id;
+}
+
+/* =========================================================
+ * 3) Translator helper → tolerant to both {to/from} and {target/source}
+ *    and to multiple response shapes.
+ * =======================================================*/
+function translate_text_via_wp_endpoint( $text, $to, $from = 'en' ) {
+  $text = is_string($text) ? $text : wp_json_encode($text);
+  $to   = is_string($to)   ? strtolower(trim($to))   : '';
+  $from = is_string($from) ? strtolower(trim($from)) : 'en';
+  if ($text === '' || $to === '') return $text;
+
+  $endpoint = site_url('/wp-json/aiaas/v1/translate');
+
+  // Send BOTH payload shapes so either server handler works.
+  $payload = [
+    'text'   => $text,
+    'to'     => $to,            // some servers expect {to, from}
+    'from'   => $from,
+    'target' => $to,            // others expect {target, source}
+    'source' => $from,
+    'format' => 'text'
+  ];
+
+  $res = wp_remote_post($endpoint, [
+    'headers' => ['Content-Type' => 'application/json'],
+    'body'    => wp_json_encode($payload),
+    'timeout'   => 30,
+    'sslverify' => true,
+  ]);
+
+  if (is_wp_error($res)) return $text;
+
+  $body = json_decode(wp_remote_retrieve_body($res), true);
+
+  // Accept many shapes:
+  // {translated:"..."}, {translation:"..."}, {text:"..."},
+  // {result:{translated_text:"..."}}, {data:{translated_text:"..."}}
+  $translated =
+    ($body['translated'] ?? null) ?:
+    ($body['translation'] ?? null) ?:
+    ($body['text'] ?? null) ?:
+    (($body['result']['translated_text'] ?? null) ?: ($body['data']['translated_text'] ?? null));
+
+  if (!is_string($translated) || $translated === '') return $text;
+  return $translated;
+}
+
+/* Human label for language codes (extend as needed) */
+function aiaas_language_label( $code ) {
+  $code = strtolower(trim($code));
+  $map = [
+    'en' => 'English',
+    'ar' => 'Arabic',
+    'fr' => 'French',
+    'es' => 'Spanish',
+    'de' => 'German',
+    'it' => 'Italian',
+    'pt' => 'Portuguese',
+    'nl' => 'Dutch',
+    'sv' => 'Swedish',
+    'pl' => 'Polish',
+    'tr' => 'Turkish',
+    'ru' => 'Russian',
+    'zh' => 'Chinese',
+    'ja' => 'Japanese',
+  ];
+  return $map[$code] ?? strtoupper($code);
+}
+
+/* =========================================================
+ * 3.1) Locale + date helpers for shortcode dates
+ * =======================================================*/
+function aiaas_language_to_locale( $lang ) {
+  $k = strtolower(trim((string)$lang));
+  $map = [
+    'en' => 'en_GB', 'english' => 'en_GB',
+    'ar' => 'ar_EG', 'arabic'  => 'ar_EG', 'العربية' => 'ar_EG', 'عربي' => 'ar_EG',
+    'fr' => 'fr_FR', 'french'  => 'fr_FR',
+    'es' => 'es_ES', 'spanish' => 'es_ES',
+    'de' => 'de_DE', 'german'  => 'de_DE',
+    'it' => 'it_IT', 'italian' => 'it_IT',
+    'pt' => 'pt_PT', 'portuguese' => 'pt_PT',
+    'nl' => 'nl_NL', 'dutch' => 'nl_NL',
+    'sv' => 'sv_SE', 'swedish' => 'sv_SE',
+    'pl' => 'pl_PL', 'polish'  => 'pl_PL',
+    'tr' => 'tr_TR', 'turkish' => 'tr_TR',
+    'ru' => 'ru_RU', 'russian' => 'ru_RU',
+    'zh' => 'zh_CN', 'chinese' => 'zh_CN',
+    'ja' => 'ja_JP', 'japanese'=> 'ja_JP',
+  ];
+  return $map[$k] ?? '';
+}
+
+function aiaas_language_to_code( $lang ) {
+  $k = strtolower(trim((string)$lang));
+  $map = [
+    'en' => 'en', 'english' => 'en',
+    'ar' => 'ar', 'arabic' => 'ar', 'العربية' => 'ar', 'عربي' => 'ar',
+    'fr' => 'fr', 'french' => 'fr',
+    'es' => 'es', 'spanish' => 'es',
+    'de' => 'de', 'german' => 'de',
+    'it' => 'it', 'italian' => 'it',
+    'pt' => 'pt', 'portuguese' => 'pt',
+    'nl' => 'nl', 'dutch' => 'nl',
+    'sv' => 'sv', 'swedish' => 'sv',
+    'pl' => 'pl', 'polish' => 'pl',
+    'tr' => 'tr', 'turkish' => 'tr',
+    'ru' => 'ru', 'russian' => 'ru',
+    'zh' => 'zh', 'chinese' => 'zh',
+    'ja' => 'ja', 'japanese'=> 'ja',
+  ];
+  return $map[$k] ?? 'en';
+}
+
+/**
+ * Format a timestamp in the language specified by the shortcode’s language param.
+ * Prefers IntlDateFormatter; falls back to translating an English string via the /translate endpoint.
+ */
+function aiaas_format_date_for_language( $timestamp, $shortcode_language ) {
+  $timestamp = is_numeric($timestamp) ? (int)$timestamp : time();
+  $locale = aiaas_language_to_locale( $shortcode_language );
+  $code   = aiaas_language_to_code( $shortcode_language );
+
+  // Best path: PHP intl
+  if ( class_exists('\\IntlDateFormatter') && $locale ) {
+    try {
+      $tz  = wp_timezone_string() ?: 'UTC';
+      $fmt = new \IntlDateFormatter($locale, \IntlDateFormatter::LONG, \IntlDateFormatter::NONE, $tz, \IntlDateFormatter::GREGORIAN);
+      $fmt->setPattern('d MMMM y'); // e.g., ١٤ أكتوبر ٢٠٢٥
+      $out = $fmt->format($timestamp);
+      if (is_string($out) && $out !== '') return $out;
+    } catch (\Throwable $e) {}
+  }
+
+  // Fallback: English → translate via endpoint with code (e.g., "ar")
+  $english = wp_date( 'F j, Y', $timestamp, new \DateTimeZone( wp_timezone_string() ?: 'UTC' ) );
+  if ($code === 'en') return $english;
+
+  return translate_text_via_wp_endpoint( $english, $code, 'en' );
+}
+
+/* =========================================================
+ * 4) REST: /aiaas/v1/value-image (OpenAI) — returns JSON fields
+ * =======================================================*/
+add_action('rest_api_init', function () {
+  register_rest_route('aiaas/v1', '/value-image', [
+    'methods'  => 'POST',
+    'callback' => __NAMESPACE__ . '\\value_image_handler',
+    'permission_callback' => '__return_true',
+  ]);
+
+  register_rest_route('aiaas/v1', '/save-asset', [
+    'methods'  => 'POST',
+    'callback' => __NAMESPACE__ . '\\save_asset_handler',
+    'permission_callback' => '__return_true',
+  ]);
+});
+
+function value_image_handler( \WP_REST_Request $req ) {
+  $p = $req->get_json_params();
+  $dataUrl = isset($p['image']) ? (string)$p['image'] : '';
+  if (!$dataUrl || strpos($dataUrl, 'data:image/') !== 0) {
+    return new \WP_REST_Response(['error' => 'Missing or invalid image data URL'], 400);
+  }
+
+  $apiKey = defined('OPENAI_API_KEY') ? OPENAI_API_KEY : getenv('OPENAI_API_KEY');
+  if (!$apiKey) return new \WP_REST_Response(['error' => 'Server missing OPENAI_API_KEY'], 500);
+
+  $system  = 'You are a valuation expert. Return STRICT JSON ONLY with keys: category, brand, model, specs, valuation_gbp, price_low_gbp, price_high_gbp, confidence (0-1), notes. No prose.';
+  $userTxt = 'Identify the main item in this photo and provide a realistic fair-market valuation in GBP (or a low/high range). Return ONLY JSON.';
+
+  $payload = [
+    'model'    => 'gpt-4o-mini',
+    'messages' => [
+      ['role' => 'system', 'content' => $system],
+      ['role' => 'user', 'content' => [
+        ['type' => 'text', 'text' => $userTxt],
+        ['type' => 'image_url', 'image_url' => ['url' => $dataUrl]],
+      ]],
+    ],
+    'temperature' => 0.2,
+  ];
+
+  $res = wp_remote_post('https://api.openai.com/v1/chat/completions', [
+    'headers' => [
+      'Authorization' => 'Bearer ' . $apiKey,
+      'Content-Type'  => 'application/json',
+    ],
+    'body'      => wp_json_encode($payload),
+    'timeout'   => 60,
+    'sslverify' => true,
+  ]);
+
+  if (is_wp_error($res)) {
+    return new \WP_REST_Response(['error' => $res->get_error_message()], 500);
+  }
+
+  $body = json_decode(wp_remote_retrieve_body($res), true);
+  $text = $body['choices'][0]['message']['content'] ?? '';
+
+  $out = json_decode($text, true);
+  if (!is_array($out) && preg_match('/\{.*\}/s', $text, $m)) {
+    $out = json_decode($m[0], true);
+  }
+  if (!is_array($out)) {
+    return new \WP_REST_Response(['error' => 'Unparseable model output', 'raw' => $text], 502);
+  }
+
+  $normalized = [
+    'category'       => $out['category']        ?? '',
+    'brand'          => $out['brand']           ?? '',
+    'model'          => $out['model']           ?? '',
+    'specs'          => $out['specs']           ?? '',
+    'valuation_gbp'  => $out['valuation_gbp']   ?? '',
+    'price_low_gbp'  => $out['price_low_gbp']   ?? null,
+    'price_high_gbp' => $out['price_high_gbp']  ?? null,
+    'confidence'     => $out['confidence']      ?? null,
+    'notes'          => $out['notes']           ?? '',
+  ];
+
+  return new \WP_REST_Response($normalized, 200);
+}
+
+/* =========================================================
+ * 5) Create a single post for one language
+ * =======================================================*/
+function create_asset_post( $payload, $lang_code = 'en', $lang_label = 'English' ) {
+  $category = sanitize_text_field($payload['category'] ?? '');
+  $brand    = sanitize_text_field($payload['brand'] ?? '');
+  $model    = sanitize_text_field($payload['model'] ?? '');
+  $specs_in = $payload['specs'] ?? '';
+  $specs    = is_string($specs_in) ? $specs_in : wp_json_encode($specs_in);
+
+  $val_gbp  = sanitize_text_field($payload['valuation_gbp'] ?? ($payload['gbp'] ?? ''));
+  $low_gbp  = isset($payload['price_low_gbp'])  ? floatval($payload['price_low_gbp'])  : null;
+  $high_gbp = isset($payload['price_high_gbp']) ? floatval($payload['price_high_gbp']) : null;
+
+  $conf     = isset($payload['confidence']) ? floatval($payload['confidence']) : '';
+  $notes_in = $payload['notes'] ?? '';
+  $notes    = is_string($notes_in) ? $notes_in : wp_json_encode($notes_in);
+  $image    = $payload['image'] ?? '';
+
+  // Optional USD-related fields (kept for future)
+  $val_usd_numeric = isset($payload['valuation_usd_numeric']) ? floatval($payload['valuation_usd_numeric']) : null;
+  $low_usd         = isset($payload['price_low_usd']) ? floatval($payload['price_low_usd']) : null;
+  $high_usd        = isset($payload['price_high_usd']) ? floatval($payload['price_high_usd']) : null;
+  $fx_gbp_usd      = isset($payload['fx_rate_gbp_usd']) ? floatval($payload['fx_rate_gbp_usd']) : null;
+  $val_usd_display = isset($payload['valuation_usd_display']) ? sanitize_text_field($payload['valuation_usd_display']) : '';
+
+  // Build title parts
+  $title_parts = array_filter([$brand, $model]);
+  if (empty($title_parts)) $title_parts = array_filter([$category, $model]);
+  if (empty($title_parts)) $title_parts = ['Asset'];
+  $title_src = implode(' ', $title_parts);
+
+  // Translate title/specs/notes as needed
+  $from = strtolower(trim($payload['from'] ?? 'en')) ?: 'en';
+  $lc   = strtolower(trim($lang_code));
+
+  $title_final = ($lc === 'en' && $from === 'en') ? $title_src : translate_text_via_wp_endpoint($title_src, $lc, $from);
+  $specs_final = ($lc === 'en' && $from === 'en') ? $specs    : translate_text_via_wp_endpoint($specs, $lc, $from);
+  $notes_final = ($lc === 'en' && $from === 'en') ? $notes    : translate_text_via_wp_endpoint($notes, $lc, $from);
+
+  $post_id = wp_insert_post([
+    'post_type'   => 'aiaas_asset',
+    'post_status' => 'publish',
+    'post_title'  => $title_final,
+  ], true);
+  if (is_wp_error($post_id)) {
+    return new \WP_Error('insert_failed', $post_id->get_error_message());
+  }
+
+  update_post_meta($post_id, 'category', $category);
+  update_post_meta($post_id, 'brand', $brand);
+  update_post_meta($post_id, 'model', $model);
+  update_post_meta($post_id, 'specs', sanitize_text_field($specs_final));
+
+  if ($val_gbp !== '')     update_post_meta($post_id, 'valuation_gbp', $val_gbp);
+  if ($low_gbp !== null)   update_post_meta($post_id, 'price_low_gbp', $low_gbp);
+  if ($high_gbp !== null)  update_post_meta($post_id, 'price_high_gbp', $high_gbp);
+  if ($conf !== '')        update_post_meta($post_id, 'confidence', $conf);
+  if ($notes_final !== '') update_post_meta($post_id, 'notes', sanitize_text_field($notes_final));
+
+  if ($val_usd_numeric !== null) update_post_meta($post_id, 'valuation_usd_numeric', $val_usd_numeric);
+  if ($low_usd !== null)         update_post_meta($post_id, 'price_low_usd', $low_usd);
+  if ($high_usd !== null)        update_post_meta($post_id, 'price_high_usd', $high_usd);
+  if ($fx_gbp_usd !== null)      update_post_meta($post_id, 'fx_rate_gbp_usd', $fx_gbp_usd);
+  if ($val_usd_display !== '')   update_post_meta($post_id, 'valuation_usd_display', $val_usd_display);
+
+  update_post_meta($post_id, 'Language', $lang_label ?: $lc);
+  update_post_meta($post_id, 'LanguageCode', $lc);
+
+  if (!empty($image)) {
+    save_base64_image($image, $post_id);
+  }
+
+  if (!empty($payload['custom_fields']) && is_array($payload['custom_fields'])) {
+    foreach ($payload['custom_fields'] as $k => $v) {
+      $key = sanitize_text_field($k);
+      if ($key === '') continue;
+      if (is_scalar($v)) {
+        update_post_meta($post_id, $key, sanitize_text_field((string)$v));
+      } else {
+        update_post_meta($post_id, $key, wp_json_encode($v));
+      }
+    }
+  }
+
+  return $post_id;
+}
+
+/* =========================================================
+ * 6) REST: /aiaas/v1/save-asset (multi-language fan-out)
+ * =======================================================*/
+function save_asset_handler( \WP_REST_Request $req ) {
+  $p = $req->get_json_params();
+
+  $languages = $p['languages'] ?? ['en'];
+  if (!is_array($languages) || empty($languages)) $languages = ['en'];
+
+  $norm = [];
+  foreach ($languages as $lng) {
+    if (!is_string($lng)) continue;
+    $lng = strtolower(trim($lng));
+    if ($lng === '') continue;
+    $norm[$lng] = true;
+  }
+  $languages = array_keys($norm);
+
+  $p['from'] = isset($p['from']) && is_string($p['from']) ? strtolower(trim($p['from'])) : 'en';
+
+  $created = [];
+  foreach ($languages as $lc) {
+    $label = aiaas_language_label($lc);
+    $res = create_asset_post($p, $lc, $label);
+    if (is_wp_error($res)) {
+      return new \WP_REST_Response([
+        'error'   => 'Failed to create one or more language variants',
+        'detail'  => $res->get_error_message(),
+        'created' => $created,
+        'failed'  => $lc,
+      ], 500);
+    }
+    $created[] = [
+      'language' => $label,
+      'code'     => $lc,
+      'id'       => $res,
+      'link'     => get_permalink($res),
+    ];
+  }
+
+  return new \WP_REST_Response(['created' => $created], 200);
+}
+
+/* =========================================================
+ * 7) Shortcode: [aiaas_assets_table language=""]
+ *    - Filters by "Language" (label) or "LanguageCode" (code)
+ *    - Arabic UI/RTL when ar/ar-eg/arabic
+ *    - Date column localized to shortcode language
+ * =======================================================*/
+add_shortcode('aiaas_assets_table', function($atts){
+
+  $atts = shortcode_atts([
+    'language' => '',   // label ("Arabic") or code ("ar")
+  ], $atts, 'aiaas_assets_table');
+
+  $lang_raw = trim((string)$atts['language']);
+  $lang_lc  = strtolower($lang_raw);
+
+  $is_ar = in_array($lang_lc, ['ar','ar-eg','ar-sa','arabic','العربية','عربي'], true);
+
+  $args = [
+    'post_type'      => 'aiaas_asset',
+    'posts_per_page' => -1,
+    'orderby'        => 'date',
+    'order'          => 'DESC',
+  ];
+
+  if ($lang_raw !== '') {
+    $args['meta_query'] = [
+      'relation' => 'OR',
+      ['key' => 'Language',     'value' => $lang_raw,          'compare' => '='],
+      ['key' => 'LanguageCode', 'value' => strtolower($lang_raw), 'compare' => '='],
+    ];
+  }
+
+  $q = new \WP_Query($args);
+
+  $th_image     = $is_ar ? 'الصورة' : 'Image';
+  $th_title     = $is_ar ? 'العنوان' : 'Title';
+  $th_category  = $is_ar ? 'الفئة' : 'Category';
+  $th_brand     = $is_ar ? 'العلامة التجارية' : 'Brand';
+  $th_model     = $is_ar ? 'الطراز' : 'Model';
+  $th_specs     = $is_ar ? 'المواصفات' : 'Specs';
+  $th_val_gbp   = $is_ar ? 'التقييم (جنيه إسترليني)' : 'Valuation (GBP)';
+  $th_conf      = $is_ar ? 'مستوى الثقة' : 'Confidence';
+  $th_date      = $is_ar ? 'التاريخ' : 'Date';
+
+  $table_dir  = $is_ar ? ' dir="rtl"' : '';
+
+  ob_start(); ?>
+  <style>
+    .aiaas-table{ width:100%; border-collapse:collapse; }
+    .aiaas-table th, .aiaas-table td{
+      padding:8px 10px; border-bottom:1px solid #e5e5e5; text-align:<?php echo $is_ar ? 'right' : 'left'; ?>;
+      vertical-align:middle;
+    }
+    .aiaas-thumb{ width:56px; height:56px; object-fit:cover; border-radius:8px; }
+    .aiaas-table thead th{ background:#fafafa; }
+    @media (max-width:640px){
+      .aiaas-hide-sm{ display:none; }
+    }
+  </style>
+  <table class="aiaas-table" id="aiaasTable"<?php echo $table_dir; ?> data-language="<?php echo esc_attr($lang_raw); ?>">
+    <thead>
+      <tr>
+        <th><?php echo esc_html($th_image); ?></th>
+        <th><?php echo esc_html($th_title); ?></th>
+        <th class="aiaas-hide-sm"><?php echo esc_html($th_category); ?></th>
+        <th><?php echo esc_html($th_brand); ?></th>
+        <th><?php echo esc_html($th_model); ?></th>
+        <th class="aiaas-hide-sm"><?php echo esc_html($th_specs); ?></th>
+        <th><?php echo esc_html($th_val_gbp); ?></th>
+        <th class="aiaas-hide-sm"><?php echo esc_html($th_conf); ?></th>
+        <th class="aiaas-hide-sm"><?php echo esc_html($th_date); ?></th>
+      </tr>
+    </thead>
+    <tbody>
+    <?php if ($q->have_posts()): while($q->have_posts()): $q->the_post();
+      $pid      = get_the_ID();
+      $thumb    = get_the_post_thumbnail_url($pid, 'thumbnail');
+      $category = get_post_meta($pid,'category',true);
+      $brand    = get_post_meta($pid,'brand',true);
+      $model    = get_post_meta($pid,'model',true);
+      $specs    = get_post_meta($pid,'specs',true);
+      $val_gbp  = get_post_meta($pid,'valuation_gbp',true);
+      $conf     = get_post_meta($pid,'confidence',true);
+      $row_lang = get_post_meta($pid,'Language',true);
+
+      // Localised date for the Date column (based on shortcode language)
+      $ts = get_post_time( 'U', true ); // GMT timestamp
+      $date_display = aiaas_format_date_for_language( $ts, $lang_raw );
+    ?>
+      <tr data-language="<?php echo esc_attr($row_lang); ?>">
+        <td><?php if($thumb): ?><img src="<?php echo esc_url($thumb); ?>" class="aiaas-thumb" alt=""><?php endif; ?></td>
+        <td><a href="<?php the_permalink(); ?>"><?php the_title(); ?></a></td>
+        <td class="aiaas-hide-sm"><?php echo esc_html($category); ?></td>
+        <td><?php echo esc_html($brand); ?></td>
+        <td><?php echo esc_html($model); ?></td>
+        <td class="aiaas-hide-sm"><?php echo esc_html($specs); ?></td>
+        <td><?php echo esc_html($val_gbp); ?></td>
+        <td class="aiaas-hide-sm"><?php echo ($conf !== '' ? esc_html($conf) : '—'); ?></td>
+        <td class="aiaas-hide-sm"><?php echo esc_html($date_display); ?></td>
+      </tr>
+    <?php endwhile; wp_reset_postdata(); else: ?>
+      <tr><td colspan="9" style="text-align:center; padding:14px;"><?php echo $is_ar ? 'لا توجد أصول.' : 'No assets found.'; ?></td></tr>
+    <?php endif; ?>
+    </tbody>
+  </table>
+  <?php
+  return ob_get_clean();
+});
