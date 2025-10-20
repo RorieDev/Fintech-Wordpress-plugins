@@ -1,0 +1,403 @@
+<?php
+/**
+ * Plugin Name:  TamRor Zoya Sharia Check
+ * Description:  Minimal REST endpoint to Sharia-screen stock symbols for the TamRor Alpaca demo. Returns {status, reasons, ratios, methodology}.
+ * Version:      1.1.0
+ * Author:       TamRor
+ */
+
+if (!defined('ABSPATH')) exit;
+
+add_action('rest_api_init', function () {
+  register_rest_route('aiaas/v1', '/sharia-check', array(
+    'methods'  => 'GET',
+    'callback' => 'tamror_sharia_check_endpoint',
+    'permission_callback' => '__return_true', // public read (no keys exposed here)
+    'args' => array(
+      'symbol' => array('required' => true, 'sanitize_callback' => 'tamror_sanitize_symbol'),
+    ),
+  ));
+});
+
+/**
+ * Basic AAOIFI-like screen (example thresholds). Replace logic with your data source if available.
+ * Returns:
+ *  - status: 'halal' | 'haram' | 'review' | 'unknown'
+ *  - reasons: array of strings
+ *  - ratios: associative array of computed metrics
+ *  - methodology: string tag
+ */
+function tamror_sharia_check_endpoint(WP_REST_Request $req) {
+  $symbol = strtoupper($req->get_param('symbol') ?: '');
+
+  $zoya_result = null;
+  if ($symbol !== '') {
+    $zoya_result = tamror_fetch_zoya_decision($symbol);
+    if (is_wp_error($zoya_result)) {
+      /**
+       * Give integrators a chance to observe / log the failure without leaking it to the client.
+       */
+      do_action('tamror_zoya_request_failed', $zoya_result, $symbol);
+      $zoya_result = null;
+    }
+  }
+
+  if (is_array($zoya_result) && isset($zoya_result['status'])) {
+    $response = array(
+      'status'      => $zoya_result['status'],
+      'symbol'      => $symbol,
+      'reasons'     => isset($zoya_result['reasons']) ? (array) $zoya_result['reasons'] : array(),
+      'ratios'      => isset($zoya_result['ratios']) && is_array($zoya_result['ratios']) ? $zoya_result['ratios'] : array(),
+      'methodology' => isset($zoya_result['methodology']) ? $zoya_result['methodology'] : 'Zoya API',
+      'ts'          => time(),
+    );
+
+    /**
+     * @since 1.1.0 Added $zoya_result to the filter args so downstream code can read the raw payload.
+     */
+    $response = apply_filters('tamror_sharia_response', $response, $symbol, $zoya_result);
+
+    return new WP_REST_Response($response, 200);
+  }
+
+  // --- Example data source ---
+  // In production, pull fundamentals from your server-side provider
+  // (Alpaca Fundamentals API / other). Here we provide a tiny demo map and a fallback.
+  $demo = array(
+    'AAPL' => array(
+      'non_compliant_revenue_pct' => 1.2,   // % revenue from riba/haram businesses
+      'debt_to_marketcap'         => 12.0,  // %
+      'cash_interest_to_marketcap'=> 9.0,   // %
+    ),
+    'TSLA' => array(
+      'non_compliant_revenue_pct' => 0.4,
+      'debt_to_marketcap'         => 3.0,
+      'cash_interest_to_marketcap'=> 2.0,
+    ),
+    'META' => array(
+      'non_compliant_revenue_pct' => 6.4,
+      'debt_to_marketcap'         => 1.0,
+      'cash_interest_to_marketcap'=> 6.0,
+    ),
+    'BAC' => array( // bank example -> likely haram
+      'non_compliant_revenue_pct' => 3.0,
+      'debt_to_marketcap'         => 20.0,
+      'cash_interest_to_marketcap'=> 25.0,
+    ),
+    'ORCL' => array( // 
+      'non_compliant_revenue_pct' => 2.0,
+      'debt_to_marketcap'         => 40.0,
+      'cash_interest_to_marketcap'=> 15.0,
+    ),
+    'GOOG' => array( // 
+      'non_compliant_revenue_pct' => 1.0,
+      'debt_to_marketcap'         => 2.0,
+      'cash_interest_to_marketcap'=> 40.0,
+    ),
+    'NVDA' => array( // 
+      'non_compliant_revenue_pct' => 4.0,
+      'debt_to_marketcap'         => 20.0,
+      'cash_interest_to_marketcap'=> 25.0,
+    ),
+  );
+
+  $ratios = isset($demo[$symbol]) ? $demo[$symbol] : array(
+    // Unknown symbol → mark review with empty ratios
+  );
+
+  // Thresholds (tune to your standard)
+  $limits = array(
+    'non_compliant_revenue_pct'  => 5.0,  // ≤ 5%
+    'debt_to_marketcap'          => 30.0, // ≤ 30%
+    'cash_interest_to_marketcap' => 30.0, // ≤ 30%
+  );
+
+  $status  = 'review';
+  $reasons = array();
+
+  if (empty($ratios)) {
+    $status = 'unknown';
+  } else {
+    $fails = 0;
+
+    if ($ratios['non_compliant_revenue_pct'] > $limits['non_compliant_revenue_pct']) {
+      $fails++; $reasons[] = 'Non-compliant revenue above limit';
+    }
+    if ($ratios['debt_to_marketcap'] > $limits['debt_to_marketcap']) {
+      $fails++; $reasons[] = 'Debt/MarketCap above limit';
+    }
+    if ($ratios['cash_interest_to_marketcap'] > $limits['cash_interest_to_marketcap']) {
+      $fails++; $reasons[] = 'Cash & interest above limit';
+    }
+
+    if ($fails === 0) {
+      $status = 'halal';
+    } elseif ($fails >= 2) {
+      $status = 'haram';
+    } else {
+      $status = 'review';
+    }
+  }
+
+  $response = array(
+    'status'      => $status,
+    'symbol'      => $symbol,
+    'reasons'     => $reasons,
+    'ratios'      => $ratios,
+    'methodology' => 'AAOIFI',
+    'ts'          => time(),
+  );
+
+  // Allow customization via filter if you add a real datasource later.
+  $response = apply_filters('tamror_sharia_response', $response, $symbol, null);
+
+  return new WP_REST_Response($response, 200);
+}
+
+function tamror_sanitize_symbol($s) {
+  $s = strtoupper($s);
+  // keep A–Z, 0–9, dot, dash
+  return preg_replace('/[^A-Z0-9\.\-]/', '', $s);
+}
+
+/**
+ * Attempt to fetch the Shariah compliance decision from the Zoya API.
+ *
+ * @param string $symbol
+ * @return array|WP_Error
+ */
+function tamror_fetch_zoya_decision($symbol) {
+  $symbol = tamror_sanitize_symbol($symbol);
+  if ($symbol === '') {
+    return new WP_Error('tamror_invalid_symbol', __('Symbol is required for Zoya lookup', 'tamror'));
+  }
+
+  $default_endpoint = 'https://api.zoya.finance/integration/v1/screener';
+  $endpoint = apply_filters('tamror_zoya_endpoint', $default_endpoint, $symbol);
+
+  if (empty($endpoint)) {
+    return new WP_Error('tamror_missing_zoya_endpoint', __('Zoya API endpoint not configured', 'tamror'));
+  }
+
+  $api_key = tamror_resolve_zoya_api_key();
+  if (empty($api_key)) {
+    return new WP_Error('tamror_missing_zoya_key', __('Zoya API key not configured', 'tamror'));
+  }
+
+  $body = array('symbol' => $symbol);
+  $request_args = array(
+    'timeout' => apply_filters('tamror_zoya_timeout', 12, $symbol),
+    'headers' => array(
+      'Content-Type'  => 'application/json',
+      'Accept'        => 'application/json',
+      'Authorization' => 'Bearer ' . $api_key,
+    ),
+    'body'    => wp_json_encode($body),
+  );
+
+  $request_args = apply_filters('tamror_zoya_request_args', $request_args, $symbol, $body);
+
+  $http_response = wp_remote_post($endpoint, $request_args);
+  if (is_wp_error($http_response)) {
+    return $http_response;
+  }
+
+  $status_code = wp_remote_retrieve_response_code($http_response);
+  if ($status_code < 200 || $status_code >= 300) {
+    return new WP_Error(
+      'tamror_zoya_http_error',
+      sprintf(__('Zoya API returned HTTP %d', 'tamror'), $status_code),
+      array('response' => $http_response)
+    );
+  }
+
+  $body = wp_remote_retrieve_body($http_response);
+  $decoded = json_decode($body, true);
+  if (json_last_error() !== JSON_ERROR_NONE) {
+    return new WP_Error('tamror_zoya_json_error', __('Unable to parse Zoya API response', 'tamror'));
+  }
+
+  $normalized = tamror_normalize_zoya_payload($decoded, $symbol);
+  if ($normalized === null) {
+    return new WP_Error('tamror_zoya_missing_status', __('Zoya API response missing compliance decision', 'tamror'));
+  }
+
+  return $normalized;
+}
+
+/**
+ * Extract status / reasons / ratios from a Zoya API payload.
+ *
+ * @param array $payload
+ * @param string $symbol
+ * @return array|null
+ */
+function tamror_normalize_zoya_payload($payload, $symbol) {
+  if (!is_array($payload)) {
+    return null;
+  }
+
+  $status_value = tamror_array_find_first($payload, array('status', 'compliance_status', 'shariah_status', 'decision', 'result'));
+  $status = null;
+  if (is_string($status_value)) {
+    $status = tamror_normalize_status_string($status_value);
+  }
+
+  if ($status === null) {
+    $compliant_flag = tamror_array_find_first($payload, array('is_compliant', 'compliant', 'shariah_compliant', 'is_halal'));
+    if ($compliant_flag !== null) {
+      $status = filter_var($compliant_flag, FILTER_VALIDATE_BOOLEAN, FILTER_NULL_ON_FAILURE);
+      if ($status === null) {
+        $status = tamror_normalize_status_string($compliant_flag);
+      } else {
+        $status = $status ? 'halal' : 'haram';
+      }
+    }
+  }
+
+  if ($status === null) {
+    return null;
+  }
+
+  $reasons_raw = tamror_array_find_first($payload, array('reasons', 'notes', 'comments', 'details', 'summary'));
+  if (!is_array($reasons_raw)) {
+    $reasons_raw = $reasons_raw ? array($reasons_raw) : array();
+  }
+  $reasons = array();
+  foreach ($reasons_raw as $reason) {
+    if (is_string($reason)) {
+      $trimmed = trim($reason);
+      if ($trimmed !== '') {
+        $reasons[] = $trimmed;
+      }
+    }
+  }
+
+  $ratios_raw = tamror_array_find_first($payload, array('ratios', 'metrics', 'financials', 'screening_metrics'));
+  $ratios = is_array($ratios_raw) ? $ratios_raw : array();
+
+  return array(
+    'status'      => $status,
+    'symbol'      => $symbol,
+    'reasons'     => $reasons,
+    'ratios'      => $ratios,
+    'methodology' => 'Zoya API',
+  );
+}
+
+/**
+ * Resolve the Zoya API key from constants, filters or environment variables.
+ *
+ * @return string
+ */
+function tamror_resolve_zoya_api_key() {
+  $key = defined('TAMROR_ZOYA_API_KEY') ? TAMROR_ZOYA_API_KEY : '';
+
+  if (empty($key)) {
+    $key = getenv('TAMROR_ZOYA_API_KEY');
+  }
+
+  if (empty($key)) {
+    $key = getenv('ZOYA_API_KEY');
+  }
+
+  /**
+   * Filter the API key resolution in case the host project stores it elsewhere (e.g. WP options).
+   */
+  $key = apply_filters('tamror_zoya_api_key', $key);
+
+  return is_string($key) ? trim($key) : '';
+}
+
+/**
+ * Recursively find the first occurrence of any key in the payload.
+ *
+ * @param array $payload
+ * @param array $keys
+ * @return mixed|null
+ */
+function tamror_array_find_first(array $payload, array $keys) {
+  foreach ($keys as $key) {
+    $found = null;
+    $exists = tamror_array_find_key($payload, $key, $found);
+    if ($exists) {
+      return $found;
+    }
+  }
+
+  return null;
+}
+
+/**
+ * Helper used by tamror_array_find_first().
+ *
+ * @param array $payload
+ * @param string $needle
+ * @param mixed $found_value
+ * @return bool Whether the key was found.
+ */
+function tamror_array_find_key(array $payload, $needle, &$found_value) {
+  if (array_key_exists($needle, $payload)) {
+    $found_value = $payload[$needle];
+    return true;
+  }
+
+  foreach ($payload as $value) {
+    if (is_array($value)) {
+      if (tamror_array_find_key($value, $needle, $found_value)) {
+        return true;
+      }
+    }
+  }
+
+  return false;
+}
+
+/**
+ * Normalize status strings coming from the API.
+ *
+ * @param mixed $status_value
+ * @return string|null
+ */
+function tamror_normalize_status_string($status_value) {
+  if (is_bool($status_value)) {
+    return $status_value ? 'halal' : 'haram';
+  }
+
+  if (!is_scalar($status_value)) {
+    return null;
+  }
+
+  $normalized = strtolower(trim((string) $status_value));
+  if ($normalized === '') {
+    return null;
+  }
+
+  $map = array(
+    'compliant'       => 'halal',
+    'halal'           => 'halal',
+    'pass'            => 'halal',
+    'approved'        => 'halal',
+    'non compliant'   => 'haram',
+    'non-compliant'   => 'haram',
+    'not_compliant'   => 'haram',
+    'failed'          => 'haram',
+    'fail'            => 'haram',
+    'declined'        => 'haram',
+    'haram'           => 'haram',
+    'pending'         => 'review',
+    'review'          => 'review',
+    'monitor'         => 'review',
+    'under_review'    => 'review',
+  );
+
+  if (isset($map[$normalized])) {
+    return $map[$normalized];
+  }
+
+  if (in_array($normalized, array('halal', 'haram', 'review', 'unknown'), true)) {
+    return $normalized;
+  }
+
+  return 'review';
+}
