@@ -1,0 +1,131 @@
+<?php
+/**
+ * Plugin Name:  TamRor Sharia Check
+ * Description:  Minimal REST endpoint to Sharia-screen stock symbols for the TamRor Alpaca demo. Returns {status, reasons, ratios, methodology}.
+ * Version:      1.0.0
+ * Author:       TamRor
+ */
+
+if (!defined('ABSPATH')) exit;
+
+add_action('rest_api_init', function () {
+  register_rest_route('aiaas/v1', '/sharia-check', array(
+    'methods'  => 'GET',
+    'callback' => 'tamror_sharia_check_endpoint',
+    'permission_callback' => '__return_true', // public read (no keys exposed here)
+    'args' => array(
+      'symbol' => array('required' => true, 'sanitize_callback' => 'tamror_sanitize_symbol'),
+    ),
+  ));
+});
+
+/**
+ * Basic AAOIFI-like screen (example thresholds). Replace logic with your data source if available.
+ * Returns:
+ *  - status: 'halal' | 'haram' | 'review' | 'unknown'
+ *  - reasons: array of strings
+ *  - ratios: associative array of computed metrics
+ *  - methodology: string tag
+ */
+function tamror_sharia_check_endpoint(WP_REST_Request $req) {
+  $symbol = strtoupper($req->get_param('symbol') ?: '');
+
+  // --- Example data source ---
+  // In production, pull fundamentals from your server-side provider
+  // (Alpaca Fundamentals API / other). Here we provide a tiny demo map and a fallback.
+  $demo = array(
+    'AAPL' => array(
+      'non_compliant_revenue_pct' => 1.2,   // % revenue from riba/haram businesses
+      'debt_to_marketcap'         => 12.0,  // %
+      'cash_interest_to_marketcap'=> 9.0,   // %
+    ),
+    'TSLA' => array(
+      'non_compliant_revenue_pct' => 0.4,
+      'debt_to_marketcap'         => 3.0,
+      'cash_interest_to_marketcap'=> 2.0,
+    ),
+    'META' => array(
+      'non_compliant_revenue_pct' => 6.4,
+      'debt_to_marketcap'         => 1.0,
+      'cash_interest_to_marketcap'=> 6.0,
+    ),
+    'BAC' => array( // bank example -> likely haram
+      'non_compliant_revenue_pct' => 3.0,
+      'debt_to_marketcap'         => 20.0,
+      'cash_interest_to_marketcap'=> 25.0,
+    ),
+    'ORCL' => array( // 
+      'non_compliant_revenue_pct' => 2.0,
+      'debt_to_marketcap'         => 40.0,
+      'cash_interest_to_marketcap'=> 15.0,
+    ),
+    'GOOG' => array( // 
+      'non_compliant_revenue_pct' => 1.0,
+      'debt_to_marketcap'         => 2.0,
+      'cash_interest_to_marketcap'=> 40.0,
+    ),
+    'NVDA' => array( // 
+      'non_compliant_revenue_pct' => 4.0,
+      'debt_to_marketcap'         => 20.0,
+      'cash_interest_to_marketcap'=> 25.0,
+    ),
+  );
+
+  $ratios = isset($demo[$symbol]) ? $demo[$symbol] : array(
+    // Unknown symbol → mark review with empty ratios
+  );
+
+  // Thresholds (tune to your standard)
+  $limits = array(
+    'non_compliant_revenue_pct'  => 5.0,  // ≤ 5%
+    'debt_to_marketcap'          => 30.0, // ≤ 30%
+    'cash_interest_to_marketcap' => 30.0, // ≤ 30%
+  );
+
+  $status  = 'review';
+  $reasons = array();
+
+  if (empty($ratios)) {
+    $status = 'unknown';
+  } else {
+    $fails = 0;
+
+    if ($ratios['non_compliant_revenue_pct'] > $limits['non_compliant_revenue_pct']) {
+      $fails++; $reasons[] = 'Non-compliant revenue above limit';
+    }
+    if ($ratios['debt_to_marketcap'] > $limits['debt_to_marketcap']) {
+      $fails++; $reasons[] = 'Debt/MarketCap above limit';
+    }
+    if ($ratios['cash_interest_to_marketcap'] > $limits['cash_interest_to_marketcap']) {
+      $fails++; $reasons[] = 'Cash & interest above limit';
+    }
+
+    if ($fails === 0) {
+      $status = 'halal';
+    } elseif ($fails >= 2) {
+      $status = 'haram';
+    } else {
+      $status = 'review';
+    }
+  }
+
+  $response = array(
+    'status'      => $status,
+    'symbol'      => $symbol,
+    'reasons'     => $reasons,
+    'ratios'      => $ratios,
+    'methodology' => 'AAOIFI',
+    'ts'          => time(),
+  );
+
+  // Allow customization via filter if you add a real datasource later.
+  $response = apply_filters('tamror_sharia_response', $response, $symbol);
+
+  return new WP_REST_Response($response, 200);
+}
+
+function tamror_sanitize_symbol($s) {
+  $s = strtoupper($s);
+  // keep A–Z, 0–9, dot, dash
+  return preg_replace('/[^A-Z0-9\.\-]/', '', $s);
+}
